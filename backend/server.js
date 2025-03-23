@@ -1,289 +1,312 @@
 const Fastify = require("fastify");
 const fastify = Fastify();
 const cors = require("@fastify/cors");
-const db = require("./database");
+const { Pool } = require('pg');
+const { drizzle } = require('drizzle-orm/node-postgres');
+const { users, risks, comments, risk_assignments } = require("./schema");
+const { eq, and, sql } = require('drizzle-orm');
+require('dotenv').config();
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  timezone: 'Europe/Brussels'
+});
+
+// Set timezone for the connection
+pool.on('connect', (client) => {
+  client.query('SET timezone = "Europe/Brussels";');
+});
+
+const db = drizzle(pool);
 
 fastify.register(cors, {
   origin: "*",
   methods: ["GET", "POST", "PUT", "DELETE"],
 });
 
-async function initializeTables() {
+fastify.addContentTypeParser('application/json', { parseAs: 'string' }, function (req, body, done) {
   try {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS risk_assignments (
-        risk_id INTEGER REFERENCES risks(id) ON DELETE CASCADE,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        assigned_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (risk_id, user_id)
-      );
-    `);
-  } catch (error) {
-    throw new Error("Failed to initialize tables: " + error.message);
+    const json = JSON.parse(body);
+    done(null, json);
+  } catch (err) {
+    err.statusCode = 400;
+    done(err, undefined);
+  }
+});
+
+async function testConnection() {
+  try {
+    const result = await pool.query('SELECT NOW()');
+    return true;
+  } catch (err) {
+    throw new Error("Database connection error: " + err.message);
   }
 }
-
-db.query("SELECT NOW()")
-  .then(() => initializeTables())
-  .catch((err) => {
-    console.error("Database initialization error:", err);
-    process.exit(1);
-  });
 
 fastify.get("/", async (req, reply) => {
   reply.send({ message: "Server is running" });
 });
 
-fastify.get("/users", async (req, reply) => {
+fastify.get("/users", async (request, reply) => {
   try {
-    const result = await db.query("SELECT * FROM users ORDER BY id");
-    reply.send(result.rows);
+    const allUsers = await db.select().from(users);
+    return allUsers;
   } catch (error) {
-    reply.status(500).send({ error: "Failed to fetch users" });
+    reply.status(500).send({ error: error.message });
   }
 });
 
-fastify.get("/risks", async (req, reply) => {
+fastify.get("/risks", async (request, reply) => {
   try {
-    const result = await db.query(`
-      WITH risk_users AS (
-        SELECT risk_id, array_agg(user_id) as assigned_user_ids
-        FROM risk_assignments
-        GROUP BY risk_id
-      )
-      SELECT 
-        risks.*, 
-        users.username,
-        risk_users.assigned_user_ids
-      FROM risks
-      LEFT JOIN users ON risks.user_id = users.id
-      LEFT JOIN risk_users ON risks.id = risk_users.risk_id
-      ORDER BY risks.id DESC
-    `);
-    reply.send(result.rows);
+    const allRisks = await db.select({
+      id: risks.id,
+      title: risks.title,
+      description: risks.description,
+      score: risks.score,
+      category: risks.category,
+      user_id: risks.user_id
+    }).from(risks);
+    
+    const assignments = await db.select({
+      risk_id: risk_assignments.risk_id,
+      user_id: risk_assignments.user_id
+    }).from(risk_assignments);
+    
+    const result = allRisks.map(risk => ({
+      ...risk,
+      assigned_user_ids: assignments
+        .filter(a => a.risk_id === risk.id)
+        .map(a => a.user_id)
+    }));
+    
+    return result;
   } catch (error) {
-    reply.status(500).send({ error: "Failed to fetch risks" });
+    reply.status(500).send({ error: error.message });
   }
 });
 
-fastify.post("/risks", async (req, reply) => {
-  const { title, description, score, category, user_id } = req.body;
-
-  if (!title || !score || !category || !user_id) {
-    return reply.status(400).send({ error: "All fields are required" });
-  }
-
+fastify.post("/risks", async (request, reply) => {
   try {
-    const insertResult = await db.query(`
-      INSERT INTO risks (title, description, score, category, user_id)
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING *
-    `, [title, description || "", score, category, user_id]);
-
-    const risk = insertResult.rows[0];
-    const userResult = await db.query(
-      "SELECT username FROM users WHERE id = $1", 
-      [user_id]
-    );
-    const username = userResult.rows[0]?.username || "Unknown";
-    reply.status(201).send({ ...risk, username });
-  } catch (error) {
-    reply.status(500).send({ error: "Failed to add risk" });
-  }
-});
-
-fastify.put("/risks/:id", async (req, reply) => {
-  const { id } = req.params;
-  const { title, description, score, category, user_id } = req.body;
-
-  if (!title || !score || !category || !user_id) {
-    return reply.status(400).send({ error: "All fields are required" });
-  }
-
-  try {
-    const result = await db.query(`
-      UPDATE risks
-      SET title = $1, description = $2, score = $3, category = $4, user_id = $5
-      WHERE id = $6
-      RETURNING *
-    `, [title, description || "", score, category, user_id, id]);
-
-    if (result.rows.length === 0) {
-      return reply.status(404).send({ error: "Risk not found" });
+    const { title, description, score, category, user_id } = request.body;
+    
+    if (!title || !score || !category || !user_id) {
+      reply.status(400).send({ error: "Missing required fields" });
+      return;
     }
-
-    const risk = result.rows[0];
-    const userResult = await db.query(
-      "SELECT username FROM users WHERE id = $1",
-      [risk.user_id]
-    );
-
-    const username = userResult.rows[0]?.username || "Unknown";
-    reply.send({ ...risk, username });
-  } catch (error) {
-    reply.status(500).send({ error: "Failed to update risk" });
-  }
-});
-
-fastify.delete("/risks/:id", async (req, reply) => {
-  const { id } = req.params;
-
-  try {
-    const result = await db.query(
-      "DELETE FROM risks WHERE id = $1 RETURNING *",
-      [id]
-    );
-
-    if (result.rows.length === 0) {
-      return reply.status(404).send({ error: "Risk not found" });
+    
+    if (typeof score !== 'number' || score < 0 || score > 10) {
+      reply.status(400).send({ error: "Score must be a number between 0 and 10" });
+      return;
     }
-
-    reply.send({ message: "Risk deleted successfully" });
+    
+    const [newRisk] = await db.insert(risks).values({
+      title,
+      description,
+      score,
+      category,
+      user_id
+    }).returning();
+    
+    return newRisk;
   } catch (error) {
-    reply.status(500).send({ error: "Failed to delete risk" });
+    reply.status(500).send({ error: error.message });
   }
 });
 
-fastify.get("/risks/:id/comments", async (req, reply) => {
-  const { id } = req.params;
-
+fastify.put("/risks/:id", async (request, reply) => {
   try {
-    const result = await db.query(`
-      SELECT comments.*, users.username
-      FROM comments
-      LEFT JOIN users ON comments.user_id = users.id
-      WHERE comments.risk_id = $1
-      ORDER BY comments.created_at ASC
-    `, [id]);
-
-    reply.send(result.rows);
-  } catch (error) {
-    reply.status(500).send({ error: "Failed to fetch comments" });
-  }
-});
-
-fastify.post("/risks/:id/comments", async (req, reply) => {
-  const { id } = req.params;
-  const { user_id, comment } = req.body;
-
-  if (!user_id || !comment || !comment.trim()) {
-    return reply.status(400).send({ error: "User and comment text are required" });
-  }
-
-  try {
-    const insertResult = await db.query(`
-      INSERT INTO comments (risk_id, user_id, comment)
-      VALUES ($1, $2, $3)
-      RETURNING *
-    `, [id, user_id, comment]);
-
-    const userResult = await db.query(
-      "SELECT username FROM users WHERE id = $1",
-      [user_id]
-    );
-
-    const username = userResult.rows[0]?.username || "Unknown";
-    reply.status(201).send({ ...insertResult.rows[0], username });
-  } catch (error) {
-    reply.status(500).send({ error: "Failed to add comment" });
-  }
-});
-
-fastify.delete("/comments/:id", async (req, reply) => {
-  const { id } = req.params;
-
-  try {
-    const result = await db.query(
-      "DELETE FROM comments WHERE id = $1 RETURNING *",
-      [id]
-    );
-
-    if (result.rows.length === 0) {
-      return reply.status(404).send({ error: "Comment not found" });
+    const { id } = request.params;
+    const { title, description, score, category } = request.body;
+    
+    if (!title || !score || !category) {
+      reply.status(400).send({ error: "Missing required fields" });
+      return;
     }
-
-    reply.send({ message: "Comment deleted" });
-  } catch (error) {
-    reply.status(500).send({ error: "Failed to delete comment" });
-  }
-});
-
-fastify.get("/risks/:id/assignments", async (req, reply) => {
-  const { id } = req.params;
-
-  try {
-    const result = await db.query(`
-      SELECT users.id, users.username
-      FROM risk_assignments
-      JOIN users ON risk_assignments.user_id = users.id
-      WHERE risk_assignments.risk_id = $1
-      ORDER BY risk_assignments.assigned_at DESC
-    `, [id]);
-    reply.send(result.rows);
-  } catch (error) {
-    reply.status(500).send({ error: "Failed to fetch assigned users" });
-  }
-});
-
-fastify.post("/risks/:id/assignments", async (req, reply) => {
-  const { id } = req.params;
-  const { user_id } = req.body;
-
-  if (!user_id) {
-    return reply.status(400).send({ error: "User ID is required" });
-  }
-
-  try {
-    const existingResult = await db.query(
-      "SELECT * FROM risk_assignments WHERE risk_id = $1 AND user_id = $2",
-      [id, user_id]
-    );
-
-    if (existingResult.rows.length > 0) {
-      return reply.status(400).send({ error: "User is already assigned to this risk" });
+    
+    if (typeof score !== 'number' || score < 0 || score > 10) {
+      reply.status(400).send({ error: "Score must be a number between 0 and 10" });
+      return;
     }
-
-    await db.query(
-      "INSERT INTO risk_assignments (risk_id, user_id) VALUES ($1, $2)",
-      [id, user_id]
-    );
-
-    const userResult = await db.query(
-      "SELECT id, username FROM users WHERE id = $1",
-      [user_id]
-    );
-
-    reply.status(201).send(userResult.rows[0]);
+    
+    const [updatedRisk] = await db
+      .update(risks)
+      .set({ title, description, score, category })
+      .where(eq(risks.id, parseInt(id)))
+      .returning();
+      
+    if (!updatedRisk) {
+      reply.status(404).send({ error: "Risk not found" });
+      return;
+    }
+    
+    return updatedRisk;
   } catch (error) {
-    reply.status(500).send({ error: "Failed to assign user" });
+    reply.status(500).send({ error: error.message });
   }
 });
 
-fastify.delete("/risks/:id/assignments/:userId", async (req, reply) => {
-  const { id, userId } = req.params;
-
+fastify.delete("/risks/:id", async (request, reply) => {
   try {
-    const result = await db.query(
-      "DELETE FROM risk_assignments WHERE risk_id = $1 AND user_id = $2 RETURNING *",
-      [id, userId]
-    );
+    const { id } = request.params;
+    const riskId = parseInt(id);
 
-    if (result.rows.length === 0) {
-      return reply.status(404).send({ error: "Assignment not found" });
-    }
 
-    reply.send({ message: "User unassigned successfully" });
+    await db.delete(comments).where(eq(comments.risk_id, riskId));
+    
+
+    await db.delete(risk_assignments).where(eq(risk_assignments.risk_id, riskId));
+    
+
+    await db.delete(risks).where(eq(risks.id, riskId));
+    
+    return { success: true };
   } catch (error) {
-    reply.status(500).send({ error: "Failed to unassign user" });
+    reply.status(500).send({ error: error.message });
+  }
+});
+
+
+fastify.get("/risks/:risk_id/comments", async (request, reply) => {
+  try {
+    const { risk_id } = request.params;
+    const commentsWithUsers = await db
+      .select({
+        id: comments.id,
+        risk_id: comments.risk_id,
+        user_id: comments.user_id,
+        comment: comments.comment,
+        created_at: comments.created_at,
+        username: users.username
+      })
+      .from(comments)
+      .leftJoin(users, eq(comments.user_id, users.id))
+      .where(eq(comments.risk_id, parseInt(risk_id)))
+      .orderBy(comments.created_at);
+    
+    return commentsWithUsers;
+  } catch (error) {
+    reply.status(500).send({ error: error.message });
+  }
+});
+
+fastify.post("/risks/:risk_id/comments", async (request, reply) => {
+  try {
+    const { risk_id } = request.params;
+    const { user_id, comment } = request.body;
+    
+    if (!user_id || !comment) {
+      reply.status(400).send({ error: "Missing required fields" });
+      return;
+    }
+    
+    const [newComment] = await db
+      .insert(comments)
+      .values({ risk_id: parseInt(risk_id), user_id, comment })
+      .returning();
+    
+    const [commentWithUser] = await db
+      .select({
+        id: comments.id,
+        risk_id: comments.risk_id,
+        user_id: comments.user_id,
+        comment: comments.comment,
+        created_at: comments.created_at,
+        username: users.username
+      })
+      .from(comments)
+      .leftJoin(users, eq(comments.user_id, users.id))
+      .where(eq(comments.id, newComment.id));
+      
+    return commentWithUser;
+  } catch (error) {
+    reply.status(500).send({ error: error.message });
+  }
+});
+
+fastify.delete("/risks/:risk_id/comments/:comment_id", async (request, reply) => {
+  try {
+    const { risk_id, comment_id } = request.params;
+    
+    const commentExists = await db
+      .select()
+      .from(comments)
+      .where(and(
+        eq(comments.id, parseInt(comment_id)),
+        eq(comments.risk_id, parseInt(risk_id))
+      ))
+      .limit(1);
+      
+    if (!commentExists.length) {
+      reply.status(404).send({ error: "Comment not found or does not belong to this risk" });
+      return;
+    }
+    
+    await db.delete(comments).where(eq(comments.id, parseInt(comment_id)));
+    return { success: true };
+  } catch (error) {
+    reply.status(500).send({ error: error.message });
+  }
+});
+
+fastify.get("/risks/:risk_id/assignments", async (request, reply) => {
+  try {
+    const { risk_id } = request.params;
+    const assignments = await db
+      .select({
+        id: users.id,
+        username: users.username
+      })
+      .from(risk_assignments)
+      .leftJoin(users, eq(risk_assignments.user_id, users.id))
+      .where(eq(risk_assignments.risk_id, parseInt(risk_id)));
+    return assignments;
+  } catch (error) {
+    reply.status(500).send({ error: error.message });
+  }
+});
+
+fastify.post("/risks/:risk_id/assignments", async (request, reply) => {
+  try {
+    const { risk_id } = request.params;
+    const { user_id } = request.body;
+
+    if (!user_id) {
+      reply.status(400).send({ error: "Missing user_id" });
+      return;
+    }
+    
+    await db
+      .insert(risk_assignments)
+      .values({ risk_id: parseInt(risk_id), user_id })
+      .onConflictDoNothing();
+    return { success: true };
+  } catch (error) {
+    reply.status(500).send({ error: error.message });
+  }
+});
+
+fastify.delete("/risks/:risk_id/assignments/:user_id", async (request, reply) => {
+  try {
+    const { risk_id, user_id } = request.params;
+    await db
+      .delete(risk_assignments)
+      .where(
+        and(
+          eq(risk_assignments.risk_id, parseInt(risk_id)),
+          eq(risk_assignments.user_id, parseInt(user_id))
+        )
+      );
+    return { success: true };
+  } catch (error) {
+    reply.status(500).send({ error: error.message });
   }
 });
 
 const start = async () => {
   try {
-    await fastify.listen({ port: 3000 });
-    console.log("Server is running on http://localhost:3000");
+    await testConnection();
+    await fastify.listen({ port: 3000, host: '0.0.0.0' });
   } catch (err) {
-    console.error("Server startup error:", err);
     process.exit(1);
   }
 };

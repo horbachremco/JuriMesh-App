@@ -84,9 +84,9 @@ export async function addComment(riskId, userId, comment) {
   }
 }
 
-export async function deleteComment(commentId) {
+export async function deleteComment(riskId, commentId) {
   try {
-    const response = await fetch(`${API_URL}/comments/${commentId}`, {
+    const response = await fetch(`${API_URL}/risks/${riskId}/comments/${commentId}`, {
       method: "DELETE",
     });
     if (!response.ok) throw new Error("Failed to delete comment");

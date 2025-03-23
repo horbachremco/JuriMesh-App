@@ -54,7 +54,7 @@ export default function RiskComments({ riskId, userId }) {
               {c.user_id === userId && (
                 <button
                   onClick={async () => {
-                    const ok = await deleteComment(c.id);
+                    const ok = await deleteComment(riskId, c.id);
                     if (ok)
                       setComments(
                         comments.filter((comment) => comment.id !== c.id)
@@ -72,7 +72,12 @@ export default function RiskComments({ riskId, userId }) {
               </div>
               <div className="text-sm text-gray-800">{c.comment}</div>
               <div className="text-xs text-gray-400 mt-1">
-                {new Date(c.created_at).toLocaleString()}
+                {new Intl.DateTimeFormat('nl-BE', {
+                  timeZone: 'Europe/Brussels',
+                  dateStyle: 'short',
+                  timeStyle: 'medium',
+                  hour12: false
+                }).format(new Date(c.created_at))}
               </div>
             </li>
           ))}
